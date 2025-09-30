@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="sv">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Chatbot (MVP) — fix för oönskad återupplivning</title>
+<style>
+:root{font-family:Inter, Roboto, Arial, sans-serif}
+body{background:#fafafa;color:#222;margin:0;padding:18px;display:flex;justify-content:center}
+.wrap{width:100%;max-width:820px}
+header{display:flex;align-items:center;gap:12px;margin-bottom:12px}
+h1{font-size:18px;margin:0}
+#chat{background:#fff;border:1px solid #e6e6e6;border-radius:10px;padding:12px;height:480px;overflow:auto;box-shadow:0 6px 18px rgba(0,0,0,0.03)}
+.msg{max-width:82%;padding:10px;border-radius:10px;margin:8px 0;white-space:pre-wrap}
+.user{margin-left:auto;background:#dff1ff;text-align:right}
+.assistant{margin-right:auto;background:#f2f2f5;text-align:left}
+.system{display:none}
+#controls{display:flex;gap:8px;margin-top:10px}
+#msgInput{flex:1;padding:10px;border-radius:8px;border:1px solid #ddd;font-size:14px}
+button{padding:10px 14px;border-radius:8px;border:0;background:#2563eb;color:#fff;cursor:pointer}
+button.secondary{background:#6b7280}
+button.positive{background:#10b981}
+button:disabled{opacity:0.6;cursor:default}
+.meta{font-size:13px;color:#666;margin-top:8px}
+.small{font-size:12px;color:#888}
+footer{margin-top:12px;font-size:13px;color:#666}
+.debug{margin-top:10px;background:#111;color:#fff;padding:8px;border-radius:6px;font-family:monospace;font-size:12px;display:none}
+.kv{font-weight:700;color:#333}
+.controls-extra{display:flex;gap:8px;margin-top:8px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Chatt (MVP) — ny anonym id per laddning</h1>
+  </header>
+
+  <div id="chat" aria-live="polite" ></div>
+
+  <div id="controls">
+    <input id="msgInput" placeholder="Skriv här..." autocomplete="off" />
+    <button id="sendBtn">Skicka</button>
+  </div>
+
+  <div class="controls-extra">
+    <button id="clearBtn" class="secondary">Rensa nu</button>
+    <button id="newConvBtn" class="positive">Ny konversation</button>
+  </div>
+
+  <div class="meta">
+    <div class="small">Skriver till Make webhook: <span id="webhookShow" class="kv">https://hook.eu2.make.com/qhakqbhaq75m0tj6cfv2hqhlr71rrv1p</span></div>
+    <div class="small">Conversation id denna laddning: <span id="convShow" class="kv"></span></div>
+    <div class="small">Tips: uppdatera sidan för att rensa konversationen (ny konversation skapas).</div>
+  </div>
+
+  <div class="debug" id="debugBox"></div>
+
+  <footer>
+    <div class="small">Notera: varje sidladdning skapar nu nytt anonymt id. Om Make sparar sessions per anonym id så kommer inte gamla order-id följa med.</div>
+  </footer>
+</div>
+
+<script>
+/* ---------- Din Make webhook (samma som tidigare) ---------- */
+const WEBHOOK_URL = "https://hook.eu2.make.com/qhakqbhaq75m0tj6cfv2hqhlr71rrv1p";
+/* ---------------------------------------------------------- */
+
+// MAX history-items (sliding window)
+const MAX_HISTORY_ITEMS = 24;
+
+// ID-generator
+function genId(prefix = 'conv_') {
+  return prefix + Math.random().toString(36).slice(2,10);
+}
+
+// Generera ny conversation id vid varje page load
+let CONVERSATION_ID = genId();
+
+// Viktigt: generera också nytt anonymt id varje page load (TA BORT sessionStorage-återanvändning)
+// Detta förhindrar att backend kopplar samma användare över långa tidsperioder.
+let ANON_USER_ID = 'anon_' + Math.random().toString(36).slice(2,8);
+
+// DOM
+const chatEl = document.getElementById('chat');
+const inputEl = document.getElementById('msgInput');
+const sendBtn = document.getElementById('sendBtn');
+const webhookShow = document.getElementById('webhookShow');
+const debugBox = document.getElementById('debugBox');
+const convShow = document.getElementById('convShow');
+const clearBtn = document.getElementById('clearBtn');
+const newConvBtn = document.getElementById('newConvBtn');
+
+webhookShow.innerText = WEBHOOK_URL;
+convShow.innerText = CONVERSATION_ID;
+
+// Håll historiken i minnet (vanlig variabel) så att den RENSAS vid reload
+let history = [
+  { role: 'system', content: 'Du är en hjälpsam assistent för webbplatsen.' }
+];
+
+// UI: rendera hela chatten
+function renderChat(){
+  chatEl.innerHTML = '';
+  for(const m of history){
+    if(m.role === 'system') continue; // döljer system-meddelande i UI
+    const d = document.createElement('div');
+    d.className = 'msg ' + (m.role === 'user' ? 'user' : 'assistant');
+    d.textContent = (m.role === 'user' ? 'Du: ' : 'AI: ') + m.content;
+    chatEl.appendChild(d);
+  }
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+// Trimma historiken (senaste N)
+function trimHistory(arr, max) {
+  if(arr.length <= max) return arr;
+  return arr.slice(arr.length - max);
+}
+
+// Bygg en säkert escaped prompt-sträng från history
+function buildPromptFromHistory(hist) {
+  // Tagga rader med roller så modellen förstår vem som sagt vad
+  const parts = hist.map(item => {
+    const tag = item.role === 'system' ? '[SYSTEM]' : item.role === 'user' ? '[USER]' : '[ASSISTANT]';
+    return `${tag}\n${item.content}`;
+  });
+  // returnera prompt bestående av alla tidigare utbyten
+  return parts.join("\n\n");
+}
+
+// Skicka payload till Make webhook
+async function postToMake(payload) {
+  try {
+    const res = await fetch(WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      mode: 'cors'
+    });
+    const text = await res.text();
+    debug('HTTP status: ' + res.status);
+    debug('Raw response: ' + text);
+    if(!res.ok) throw new Error('HTTP ' + res.status + ' — ' + text);
+    try {
+      return JSON.parse(text);
+    } catch(e) {
+      return { reply: text };
+    }
+  } catch(err) {
+    debug('Network error: ' + err.message);
+    throw err;
+  }
+}
+
+// debug-utskrift i rutan
+function debug(msg){
+  debugBox.style.display = 'block';
+  const time = new Date().toLocaleTimeString();
+  debugBox.textContent = `[${time}] ${msg}\n` + debugBox.textContent;
+}
+
+// huvudfunktion som körs vid skicka
+async function sendMessageFromUser(text) {
+  if(!WEBHOOK_URL) {
+    alert('WEBHOOK_URL är inte konfigurerad korrekt.');
+    return;
+  }
+
+  // push user message (vi sparar i history innan vi bygger prompt så prompt innehåller senaste user)
+  history.push({ role: 'user', content: text });
+  // trimma history
+  history = trimHistory(history, MAX_HISTORY_ITEMS);
+  renderChat();
+
+  // bygg prompt från hela historiken (inkl. den användare som precis skickade)
+  const promptStr = buildPromptFromHistory(history);
+
+  // payload vi skickar till Make
+  const payload = {
+    conversation_id: CONVERSATION_ID,
+    anon_user_id: ANON_USER_ID,
+    pageUrl: window.location.href,
+    history: history, // användbart för debugging i Make
+    prompt: promptStr
+  };
+
+  debug('Payload skickas till Make (kort): ' + JSON.stringify({ conversation_id: payload.conversation_id, anon_user_id: payload.anon_user_id, promptPreview: promptStr.slice(0,200) }) );
+
+  try {
+    sendBtn.disabled = true;
+    const result = await postToMake(payload);
+
+    // Förväntar vanligtvis { reply: "text..." } från Make
+    const replyText = result?.reply ?? result?.output ?? (typeof result === 'string' ? result : JSON.stringify(result));
+    history.push({ role: 'assistant', content: replyText });
+    history = trimHistory(history, MAX_HISTORY_ITEMS);
+    renderChat();
+  } catch(err) {
+    history.push({ role: 'assistant', content: 'Fel: kunde inte kontakta AI — se debugkonsol.' });
+    renderChat();
+  } finally {
+    sendBtn.disabled = false;
+  }
+}
+
+// Rensa konversation utan reload
+function clearConversation() {
+  history = [{ role: 'system', content: 'Du är en hjälpsam assistent för webbplatsen.' }];
+  renderChat();
+  debug('Konversation rensad (utan reload).');
+}
+
+// Starta ny konversation (ny conversation_id). Dessutom skickar vi ett reset till backend så Make kan rensa.
+// keepAnonUser=false kommer också byta anonymt id (om du vill det)
+async function startNewConversation({ keepAnonUser = true } = {}) {
+  // skapa ny conversation id
+  CONVERSATION_ID = genId();
+
+  if(!keepAnonUser) {
+    ANON_USER_ID = 'anon_' + Math.random().toString(36).slice(2,8);
+  }
+
+  // visa ny id i UI
+  convShow.innerText = CONVERSATION_ID;
+
+  // valfritt: be backend radera eventuell sparad session/key associerad med tidigare anon_user_id eller conv id
+  // Make-flödet kan kolla på "reset: true" och radera server-side kontext om ni implementerat detta.
+  try {
+    await postToMake({
+      conversation_id: CONVERSATION_ID,
+      anon_user_id: ANON_USER_ID,
+      reset: true,
+      note: 'frontend-request-reset' // informativt fält
+    });
+    debug('Reset-anrop skickat till backend för att rensa eventuell sparad session.');
+  } catch(e) {
+    debug('Reset-anrop misslyckades (backend kanske inte hanterar reset) — inget kritiskt.');
+  }
+
+  // rensa frontend-historik
+  clearConversation();
+  debug('Ny konversation skapad: ' + CONVERSATION_ID + ' (keepAnonUser=' + keepAnonUser + ')');
+}
+
+// UI events
+sendBtn.addEventListener('click', async () => {
+  const txt = inputEl.value.trim();
+  if(!txt) return;
+  inputEl.value = '';
+  await sendMessageFromUser(txt);
+});
+
+// allow Enter to send
+inputEl.addEventListener('keydown', (e) => {
+  if(e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendBtn.click();
+  }
+});
+
+// clear/new conversation buttons
+clearBtn.addEventListener('click', (e) => { e.preventDefault(); clearConversation(); });
+newConvBtn.addEventListener('click', (e) => { e.preventDefault(); startNewConversation({ keepAnonUser: true }); });
+
+// initial render
+renderChat();
+
+</script>
+</body>
+</html>
